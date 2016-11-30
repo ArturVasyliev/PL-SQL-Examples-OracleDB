@@ -1,0 +1,227 @@
+# Создание триггера каскадного изменения записей при изменении айди покупателя
+
+create or replace trigger cascade_modify
+after update OF CUSTOMER_ID ON CUSTOMERS
+FOR EACH ROW
+BEGIN
+UPDATE LOADS SET CUSTOMER_ID=:NEW.CUSTOMER_ID
+	where CUSTOMER_ID =:OLD.CUSTOMER_ID;
+END;
+
+
+# Создание триггера каскадного удаления записей при удалении дрона
+
+create or replace trigger cascade_delete
+before delete ON drones
+FOR EACH ROW
+BEGIN
+delete from routes where drone_Id = :old.drone_Id;
+END;
+
+
+# Обращение к словарю данных
+
+select trigger_body from user_triggers where trigger_name = 'CASCADE_DELETE';
+
+
+# Создаем таблицы для отслеживания команд для таблицы дронов
+
+CREATE TABLE COMMANDS_AUDIT (
+	AD_ID NUMBER(5) NOT NULL PRIMARY KEY, 
+	TABLE_NAME VARCHAR2(20), 
+	DATE_IN VARCHAR2(20),
+	COMMAND VARCHAR2(20)) 
+PCTFREE 10 
+PCTUSED 80 
+STORAGE(INITIAL 50K NEXT 50K MAXEXTENTS 5 PCTINCREASE 0);
+
+
+CREATE TABLE UPDATE_AUDIT (
+	ADU_ID NUMBER(5) NOT NULL PRIMARY KEY, 
+	AD_ID NUMBER(5) NOT NULL, 
+	FIELD_NAME VARCHAR2(30),
+	OLD VARCHAR2(50),
+	NEW VARCHAR2(50)) 
+PCTFREE 10 
+PCTUSED 80 
+STORAGE(INITIAL 50K NEXT 50K MAXEXTENTS 5 PCTINCREASE 0);
+
+
+# Триггер для заполнения предыдущих таблиц
+
+CREATE OR REPLACE TRIGGER T_COMMANDS_AUDIT
+AFTER DELETE  OR UPDATE OR INSERT ON DRONES
+for each row
+BEGIN
+if deleting then
+	insert into commands_audit values (my_seq.nextval, 'DRONES', to_char(sysdate), 'Delete');
+elsif inserting then
+	insert into commands_audit values (my_seq.nextval, 'DRONES', to_char(sysdate), 'Insert');
+elsif updating then
+	insert into commands_audit values (my_seq.nextval, 'DRONES', to_char(sysdate), 'Update');
+	if :old.drone_id <> :new.drone_id then
+		insert into update_audit values (mu_seq1.nextval, my_seq.currval, 'DRONE_ID', :old.drone_id, :new.drone_id);
+	end if;
+	if :old.model <> :new.model then
+		insert into update_audit values (mu_seq1.nextval, my_seq.currval, 'MODEL', :old.model, :new.model);
+	end if;
+	if :old.weight <> :new.weight then
+		insert into update_audit values (mu_seq1.nextval, my_seq.currval, 'WEIGHT', :old.weight, :new.weight);
+	end if;
+	if :old.add_weight <> :new.add_weight then
+		insert into update_audit values (mu_seq1.nextval, my_seq.currval, 'ADD_WEIGHT', :old.add_weight, :new.add_weight);
+	end if;
+	if :old.speed <> :new.speed then
+		insert into update_audit values (mu_seq1.nextval, my_seq.currval, 'SPEED', :old.speed, :new.speed);
+	end if;
+end if;
+end T_COMMAND_AUDIT;
+
+
+# Триггер, запрещающий работу с дронами на выходных
+
+create or replace trigger weekend
+before INSERT or UPDATE or DELETE on DRONES
+DECLARE
+weekends EXCEPTION;
+BEGIN
+	if to_char(sysdate, 'DY') = 'SAT' or to_char(sysdate, 'DY') = 'SUN' then
+		raise weekends;
+	end if;
+EXCEPTION
+when weekends then
+	raise_application_error(-20006, 'It is weekend now, go away.');
+END weekend;
+
+
+#Как изменить язык?
+#alter session set nls_date_language = 'ENGLISH';
+#(select * from nls_session_parameters)
+
+
+# Копия таблицы роутов для решения проблемы мутирующих таблиц
+
+CREATE TABLE ROUTES_COPY(
+	ROUTE_ID NUMBER(3) NOT NULL PRIMARY KEY,
+	DRONE_ID NUMBER(3),
+	LOAD_ID NUMBER(3),
+	START_POINT VARCHAR2(40),
+	END_POINT VARCHAR2(40),
+	START_TIME DATE,
+	END_TIME DATE,
+	DISTANCE NUMBER(5,3),
+	PRICE NUMBER(5,2))
+PCTFREE 10
+PCTUSED 80
+STORAGE(INITIAL 50K NEXT 50K MAXEXTENTS 5 PCTINCREASE 0);
+
+
+# Триггер копирования каждой второй удаляемой записи
+
+create or replace trigger delete_second_copy
+for delete on routes
+compound trigger
+cursor get_routes_copy is select * from routes_copy;
+after each row is
+begin
+	if MOD(STATIC_DATA.iter1, 2) = 0 then
+		insert into routes_copy values (:old.route_id, :old.drone_id, :old.load_id, :old.start_point, :old.end_point, :old.start_time, :old.end_time, :old.distance, :old.price);
+	end if;
+	STATIC_DATA.iter1 := STATIC_DATA.iter1 + 1;
+end after each row;
+after statement is
+begin
+	for rec in get_routes_copy loop
+		insert into routes values (rec.route_id, rec.drone_id, rec.load_id, rec.start_point, rec.end_point, rec.start_time, rec.end_time, rec.distance, rec.price);
+	end loop;
+	delete from routes_copy;
+end after statement;
+end delete_second_copy;
+
+
+# Триггер копирования каждой третьей изменяемой записи
+
+create or replace trigger update_third_copy
+for update on routes
+compound trigger
+cursor get_routes_copy is select * from routes_copy;
+after each row is
+begin
+	if MOD(STATIC_DATA.iter2, 3) = 0 then
+		insert into routes_copy values (my_seq.nextval, :old.drone_id, :old.load_id, :old.start_point, :old.end_point, :old.start_time, :old.end_time, :old.distance, :old.price);
+	end if;
+	STATIC_DATA.iter2 := STATIC_DATA.iter2 + 1;
+end after each row;
+after statement is
+begin
+	for rec in get_routes_copy loop
+		insert into routes values (rec.route_id, rec.drone_id, rec.load_id, rec.start_point, rec.end_point, rec.start_time, rec.end_time, rec.distance, rec.price);
+	end loop;
+	delete from routes_copy;
+end after statement;
+end update_third_copy;
+
+
+# Триггер ограничения на увеличение цены
+
+create or replace trigger add_price_limit
+before update of price on routes
+for each row
+begin
+	if (:old.price * 2) < :new.price then
+		:new.price := :old.price * 2;
+	end if;
+end add_price_limit;
+
+
+# Триггер запрета заказов маршрутов на более 10-ти кг в неделю
+
+create or replace trigger load_weight_limit
+before insert on loads
+for each row
+DECLARE
+sum_weight NUMBER(5,3);
+weight_limit EXCEPTION;
+begin
+select sum(weight) into sum_weight from loads where customer_id = :new.customer_id
+	and load_id in (select load_id from routes where START_TIME >= SYSDATE AND START_TIME <= SYSDATE + 7);
+if sum_weight > 10 then
+	raise weight_limit;
+end if;
+end load_weight_limit;
+	
+
+
+
+
+create or replace trigger load_weight
+for insert on loads
+compound trigger
+sum_weight NUMBER(5,3);
+weight_limit EXCEPTION;
+before statement is
+select sum(weight) into sum_weight from loads where customer_id = :new.customer_id
+	and load_id in (select load_id from routes where START_TIME >= SYSDATE AND START_TIME <= SYSDATE + 7);
+if sum_weight > 10 then
+	raise weight_limit;
+end if;
+end before statement;
+after each row is
+begin
+	if MOD(STATIC_DATA.iter2, 3) = 0 then
+		insert into routes_copy values (my_seq.nextval, :old.drone_id, :old.load_id, :old.start_point, :old.end_point, :old.start_time, :old.end_time, :old.distance, :old.price);
+	end if;
+	STATIC_DATA.iter2 := STATIC_DATA.iter2 + 1;
+end after each row;
+after statement is
+begin
+	for rec in get_routes_copy loop
+		insert into routes values (rec.route_id, rec.drone_id, rec.load_id, rec.start_point, rec.end_point, rec.start_time, rec.end_time, rec.distance, rec.price);
+	end loop;
+	delete from routes_copy;
+end after statement;
+end update_third_copy;
+
+
+
+
